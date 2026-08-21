@@ -56,7 +56,13 @@
         <div><div class="label">Relative volume</div><strong id="bestRvol">—</strong></div>
         <div><div class="label">Reason</div><strong id="bestReason">—</strong></div>
       </div>
-      <button class="primary" id="paperTrade" style="width:100%;margin-top:14px">PAPER EXECUTION DISABLED</button>
+      <form id="paperTrade" class="stack" style="margin-top:14px">
+        <div class="two"><input id="tradeSymbol" aria-label="Symbol" placeholder="Symbol"><input id="tradeQty" aria-label="Quantity" type="number" min="1" placeholder="Shares"></div>
+        <div class="two"><input id="tradeEntry" aria-label="Entry price" type="number" min="0.01" step="0.01" placeholder="Entry"><input id="tradeStop" aria-label="Stop price" type="number" min="0.01" step="0.01" placeholder="Stop"></div>
+        <input id="tradeTarget" aria-label="Target price" type="number" min="0.01" step="0.01" placeholder="Target">
+        <button class="primary" type="submit">OPEN PAPER TRADE</button>
+      </form>
+      <div class="tiny">Records a local paper position only. No broker order is sent.</div>
       <div class="tiny" id="message" aria-live="polite" style="margin-top:9px"></div>
     </div>
   </section>
@@ -85,6 +91,7 @@
       <label>Opening range <select><option>15 minutes</option><option selected>30 minutes</option><option>45 minutes</option></select></label>
       <label>Max trades/day <select><option>1</option><option selected>2</option><option>3</option></select></label>
     </div></div>
+    <div class="card"><h2>Watchlist</h2><p class="tiny">Comma-separated U.S. stock and ETF symbols. Saving rescans this list.</p><div class="stack"><input id="watchlistInput" aria-label="Watchlist symbols" placeholder="SPY, QQQ, NVDA"><button id="saveWatchlist" class="primary">SAVE WATCHLIST</button></div></div>
     <div class="card"><h2>Safety</h2><p class="tiny">Real trading is intentionally unavailable in this build. The scanner only reads Alpaca market data and logs signals locally on this Mac.</p></div>
   </section>
 </main>
@@ -101,6 +108,7 @@
 const apiBase = new URLSearchParams(location.search).get("api") || localStorage.getItem("intradayApiBase") || `${location.protocol}//${location.hostname}:8000`;
 let symbols=[];
 let selected=null;
+let currentWatchlist=[];
 const money=value => value == null ? "—" : new Intl.NumberFormat("en-US", {style:"currency",currency:"USD"}).format(value);
 function card(x){
  const cls=x.state==="SETUP"||x.state==="TREND"?"good":x.state==="WEAK"?"bad":"warn";
@@ -122,12 +130,14 @@ function renderBest(){
  document.querySelector("#bestVwap").textContent=money(selected.vwap);
  document.querySelector("#bestRvol").textContent=selected.rvol == null ? "—" : `${selected.rvol.toFixed(2)}×`;
  document.querySelector("#bestReason").textContent=selected.reason;
- document.querySelector("#message").textContent=`${selected.symbol} selected from the live scanner. Execution remains disabled.`;
+ document.querySelector("#tradeSymbol").value=selected.symbol;
+ document.querySelector("#tradeEntry").value=selected.price == null ? "" : selected.price.toFixed(2);
+ document.querySelector("#message").textContent=`${selected.symbol} selected. Enter your paper-trade stop, target, and share count.`;
 }
 function empty(message){ return `<div class="tiny">${message}</div>`; }
 async function load(){
  try {
-   const [status, scanner, positions, history]=await Promise.all(["status","scanner","positions","history"].map(path=>fetch(`${apiBase}/api/${path}`).then(r=>{if(!r.ok) throw new Error(`${path} unavailable`); return r.json();})));
+   const [status, scanner, positions, history, watchlist]=await Promise.all(["status","scanner","positions","history","watchlist"].map(path=>fetch(`${apiBase}/api/${path}`).then(r=>{if(!r.ok) throw new Error(`${path} unavailable`); return r.json();})));
    document.querySelector("#mode").textContent=status.paper_mode ? "PAPER ON" : "PAPER OFF";
    document.querySelector("#pnl").textContent=`${status.today_pnl >= 0 ? "+" : ""}${money(status.today_pnl)}`;
    document.querySelector("#pnl").className=`value ${status.today_pnl >= 0 ? "positive" : "negative"}`;
@@ -135,6 +145,7 @@ async function load(){
    document.querySelector("#openTrades").textContent=status.open_trades;
    document.querySelector("#balance").textContent=`Paper balance ${money(status.balance)}`;
    symbols=scanner; selected=scanner[0] || null; render(); renderBest();
+   currentWatchlist=watchlist.symbols; document.querySelector("#watchlistInput").value=currentWatchlist.join(", ");
    document.querySelector("#positions").innerHTML=positions.length ? positions.map(x=>`<div class="ticker"><strong>${x.symbol} · ${x.side}</strong><div class="tiny">Entry ${money(x.entry)} · Stop ${money(x.stop)} · Target ${money(x.target)}</div></div>`).join("") : empty("No open paper positions.");
    document.querySelector("#history").innerHTML=history.length ? history.map(x=>`<div class="ticker"><div class="row"><strong>${x.symbol} · ${x.side}</strong><span>${x.status}</span></div><div class="tiny">${x.opened_at || "—"} · P/L ${money(x.pnl)}</div></div>`).join("") : empty("No paper-trade history yet.");
    document.querySelector("#updated").textContent=`Updated ${new Date().toLocaleTimeString([], {hour:"numeric",minute:"2-digit"})}`;
@@ -149,8 +160,14 @@ document.querySelectorAll(".nav button").forEach(btn=>btn.addEventListener("clic
  document.getElementById(btn.dataset.page).classList.add("active");
 }));
 
-document.getElementById("paperTrade").addEventListener("click",()=>{
- document.getElementById("message").textContent="Paper execution is intentionally disabled while the scanner is being verified.";
+document.getElementById("paperTrade").addEventListener("submit",async event=>{
+ event.preventDefault();
+ const payload={symbol:document.querySelector("#tradeSymbol").value,qty:Number(document.querySelector("#tradeQty").value),entry:Number(document.querySelector("#tradeEntry").value),stop:Number(document.querySelector("#tradeStop").value),target:Number(document.querySelector("#tradeTarget").value),score:selected?.score || 0,reason:selected?.reason || "manual paper trade"};
+ try { const response=await fetch(`${apiBase}/api/paper/trade`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)}); const result=await response.json(); if(!response.ok) throw new Error(result.detail || "Paper trade was rejected"); document.querySelector("#message").textContent=`Paper trade #${result.trade_id} opened locally. No broker order was sent.`; await load(); } catch(error) { document.querySelector("#message").textContent=error.message; }
+});
+document.getElementById("saveWatchlist").addEventListener("click",async()=>{
+ const symbols=document.querySelector("#watchlistInput").value.split(",").map(symbol=>symbol.trim()).filter(Boolean);
+ try { const response=await fetch(`${apiBase}/api/watchlist`,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({symbols})}); const result=await response.json(); if(!response.ok) throw new Error(result.detail || "Watchlist was rejected"); document.querySelector("#message").textContent=`Saved ${result.symbols.length} symbols. Refreshing scanner.`; await load(); } catch(error) { document.querySelector("#message").textContent=error.message; }
 });
 </script>
 </body>

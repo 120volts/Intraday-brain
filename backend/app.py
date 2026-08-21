@@ -1,4 +1,6 @@
 import os
+import json
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +35,10 @@ class PaperTrade(BaseModel):
     reason: str = "manual paper signal"
 
 
+class WatchlistUpdate(BaseModel):
+    symbols: list[str]
+
+
 def db():
     c = sqlite3.connect(DB_PATH)
     c.row_factory = sqlite3.Row
@@ -46,6 +52,7 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS signals (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, price REAL, vwap REAL, rvol REAL, score INTEGER, state TEXT, reason TEXT, created_at TEXT)")
         c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('paper_balance', ?)", (str(PAPER_START),))
         c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('paper_mode','on')")
+        c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('watchlist', ?)", (json.dumps(WATCHLIST),))
 
 
 def get_setting(key):
@@ -57,6 +64,19 @@ def get_setting(key):
 def set_setting(key, value):
     with db() as c:
         c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+
+
+def watchlist():
+    try:
+        symbols = json.loads(get_setting("watchlist") or json.dumps(WATCHLIST))
+    except json.JSONDecodeError:
+        return WATCHLIST
+    return symbols if isinstance(symbols, list) else WATCHLIST
+
+
+def clear_scanner_cache():
+    scanner_cache["created_at"] = None
+    scanner_cache["data"] = None
 
 
 def alpaca_headers():
@@ -147,14 +167,37 @@ def status():
     return {"paper_mode": get_setting("paper_mode") == "on", "balance": float(get_setting("paper_balance") or PAPER_START), "today_pnl": float(pnl), "open_trades": open_count, "signals": signals}
 
 
+@app.get("/api/watchlist")
+def get_watchlist():
+    return {"symbols": watchlist()}
+
+
+@app.put("/api/watchlist")
+def update_watchlist(update: WatchlistUpdate):
+    symbols = []
+    for symbol in update.symbols:
+        normalized = symbol.strip().upper()
+        if not re.fullmatch(r"[A-Z]{1,5}(?:\.[A-Z])?", normalized):
+            raise HTTPException(400, f"Invalid stock symbol: {symbol}")
+        if normalized not in symbols:
+            symbols.append(normalized)
+    if not symbols:
+        raise HTTPException(400, "Choose at least one symbol")
+    if len(symbols) > 25:
+        raise HTTPException(400, "Watchlist is limited to 25 symbols")
+    set_setting("watchlist", json.dumps(symbols))
+    clear_scanner_cache()
+    return {"symbols": symbols}
+
+
 @app.get("/api/scanner")
 async def scanner():
     if cache_is_fresh():
         return scanner_cache["data"]
     if not os.getenv("APCA_API_KEY_ID"):
-        return [{"symbol": s, "price": None, "vwap": None, "rvol": None, "score": 0, "state": "NO DATA", "reason": "Configure Alpaca paper-data credentials on the server"} for s in WATCHLIST]
+        return [{"symbol": s, "price": None, "vwap": None, "rvol": None, "score": 0, "state": "NO DATA", "reason": "Configure Alpaca paper-data credentials on the server"} for s in watchlist()]
     out = []
-    for symbol in WATCHLIST:
+    for symbol in watchlist():
         try:
             x = score_frame(await bars(symbol))
             if x is None:
@@ -190,13 +233,16 @@ def paper_trade(t: PaperTrade):
         raise HTTPException(409, "Paper trading is paused")
     if t.side.lower() != "buy":
         raise HTTPException(400, "v0.1 only supports long paper trades")
+    symbol = t.symbol.strip().upper()
+    if not re.fullmatch(r"[A-Z]{1,5}(?:\.[A-Z])?", symbol):
+        raise HTTPException(400, "Invalid stock symbol")
     if t.qty < 1 or t.entry <= t.stop or t.target <= t.entry:
         raise HTTPException(400, "Invalid trade geometry")
     with db() as c:
         open_count = c.execute("SELECT COUNT(*) FROM trades WHERE status='OPEN'").fetchone()[0]
         if open_count >= 2:
             raise HTTPException(409, "Maximum open trades reached")
-        c.execute("INSERT INTO trades(symbol,side,qty,entry,stop,target,score,reason,status,opened_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (t.symbol.upper(), "BUY", t.qty, t.entry, t.stop, t.target, t.score, t.reason, "OPEN", datetime.now(timezone.utc).isoformat()))
+        c.execute("INSERT INTO trades(symbol,side,qty,entry,stop,target,score,reason,status,opened_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (symbol, "BUY", t.qty, t.entry, t.stop, t.target, t.score, t.reason, "OPEN", datetime.now(timezone.utc).isoformat()))
         trade_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
     return {"ok": True, "trade_id": trade_id}
 
