@@ -146,7 +146,8 @@ async function load(){
    document.querySelector("#balance").textContent=`Paper balance ${money(status.balance)}`;
    symbols=scanner; selected=scanner[0] || null; render(); renderBest();
    currentWatchlist=watchlist.symbols; document.querySelector("#watchlistInput").value=currentWatchlist.join(", ");
-   document.querySelector("#positions").innerHTML=positions.length ? positions.map(x=>`<div class="ticker"><strong>${x.symbol} · ${x.side}</strong><div class="tiny">Entry ${money(x.entry)} · Stop ${money(x.stop)} · Target ${money(x.target)}</div></div>`).join("") : empty("No open paper positions.");
+   document.querySelector("#positions").innerHTML=positions.length ? positions.map(x=>`<div class="ticker"><div class="row"><strong>${x.symbol} · ${x.side}</strong><button data-close="${x.id}">CLOSE</button></div><div class="tiny">${x.qty} shares · Entry ${money(x.entry)} · Stop ${money(x.stop)} · Target ${money(x.target)}</div></div>`).join("") : empty("No open paper positions.");
+   document.querySelectorAll("[data-close]").forEach(button=>button.addEventListener("click",()=>closeTrade(button.dataset.close)));
    document.querySelector("#history").innerHTML=history.length ? history.map(x=>`<div class="ticker"><div class="row"><strong>${x.symbol} · ${x.side}</strong><span>${x.status}</span></div><div class="tiny">${x.opened_at || "—"} · P/L ${money(x.pnl)}</div></div>`).join("") : empty("No paper-trade history yet.");
    document.querySelector("#updated").textContent=`Updated ${new Date().toLocaleTimeString([], {hour:"numeric",minute:"2-digit"})}`;
  } catch(error) { document.querySelector("#message").textContent=`Cannot reach the scanner at ${apiBase}. Start the FastAPI server, then refresh.`; document.querySelector("#scanner").innerHTML=empty("Scanner unavailable."); }
@@ -169,6 +170,11 @@ document.getElementById("saveWatchlist").addEventListener("click",async()=>{
  const symbols=document.querySelector("#watchlistInput").value.split(",").map(symbol=>symbol.trim()).filter(Boolean);
  try { const response=await fetch(`${apiBase}/api/watchlist`,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({symbols})}); const result=await response.json(); if(!response.ok) throw new Error(result.detail || "Watchlist was rejected"); document.querySelector("#message").textContent=`Saved ${result.symbols.length} symbols. Refreshing scanner.`; await load(); } catch(error) { document.querySelector("#message").textContent=error.message; }
 });
+async function closeTrade(tradeId){
+ const exit=Number(window.prompt("Paper exit price"));
+ if(!exit) return;
+ try { const response=await fetch(`${apiBase}/api/paper/trade/${tradeId}/close`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({exit})}); const result=await response.json(); if(!response.ok) throw new Error(result.detail || "Paper close was rejected"); document.querySelector("#message").textContent=`Paper trade #${tradeId} closed: ${money(result.pnl)}. No broker order was sent.`; await load(); } catch(error) { document.querySelector("#message").textContent=error.message; }
+}
 </script>
 </body>
 </html>

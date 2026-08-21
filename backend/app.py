@@ -39,6 +39,10 @@ class WatchlistUpdate(BaseModel):
     symbols: list[str]
 
 
+class PaperTradeClose(BaseModel):
+    exit: float
+
+
 def db():
     c = sqlite3.connect(DB_PATH)
     c.row_factory = sqlite3.Row
@@ -245,6 +249,22 @@ def paper_trade(t: PaperTrade):
         c.execute("INSERT INTO trades(symbol,side,qty,entry,stop,target,score,reason,status,opened_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (symbol, "BUY", t.qty, t.entry, t.stop, t.target, t.score, t.reason, "OPEN", datetime.now(timezone.utc).isoformat()))
         trade_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
     return {"ok": True, "trade_id": trade_id}
+
+
+@app.post("/api/paper/trade/{trade_id}/close")
+def close_paper_trade(trade_id: int, close: PaperTradeClose):
+    if close.exit <= 0:
+        raise HTTPException(400, "Exit price must be positive")
+    with db() as c:
+        trade = c.execute("SELECT * FROM trades WHERE id=? AND status='OPEN'", (trade_id,)).fetchone()
+        if not trade:
+            raise HTTPException(404, "Open paper trade not found")
+        pnl = (close.exit - trade["entry"]) * trade["qty"]
+        c.execute(
+            "UPDATE trades SET exit=?, pnl=?, status='CLOSED', closed_at=? WHERE id=?",
+            (close.exit, pnl, datetime.now(timezone.utc).isoformat(), trade_id),
+        )
+    return {"ok": True, "trade_id": trade_id, "pnl": pnl}
 
 
 @app.post("/api/paper/toggle")
