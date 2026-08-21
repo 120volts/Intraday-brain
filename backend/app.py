@@ -2,21 +2,23 @@ import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 import httpx
-import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-DB_PATH = Path(os.getenv("DB_PATH", "intraday.db"))
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "intraday.db")))
 WATCHLIST = ["SPY", "QQQ", "NVDA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "TSLA"]
 PAPER_START = float(os.getenv("PAPER_START", "25000"))
 RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.005"))
 
-app = FastAPI(title="Intraday Brain API", version="0.1.0")
+app = FastAPI(title="Intraday Brain API", version="0.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 class PaperTrade(BaseModel):
@@ -57,8 +59,10 @@ def set_setting(key, value):
 
 
 def alpaca_headers():
-    key = os.getenv("APCA_API_KEY_ID")
-    secret = os.getenv("APCA_API_SECRET_KEY")
+    # Accept both the official APCA_* names and the simpler names we used
+    # earlier while setting up the local .env file.
+    key = os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_API_KEY")
+    secret = os.getenv("APCA_API_SECRET_KEY") or os.getenv("ALPACA_SECRET_KEY")
     if not key or not secret:
         raise RuntimeError("Alpaca API credentials are not configured")
     return {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
@@ -81,17 +85,23 @@ def score_frame(df: pd.DataFrame):
         return None
     x = df.copy()
     x["t"] = pd.to_datetime(x["t"], utc=True)
-    x["vwap"] = (x.c * x.v).cumsum() / x.v.cumsum()
+    x["session"] = x["t"].dt.date
+    # VWAP resets each trading session instead of accumulating across days.
+    x["pv"] = x.c * x.v
+    x["vwap"] = x.groupby("session")["pv"].cumsum() / x.groupby("session")["v"].cumsum()
     x["vol20"] = x.v.rolling(20).mean()
     x["rvol"] = x.v / x.vol20
     x["ema9"] = x.c.ewm(span=9, adjust=False).mean()
     x["ema20"] = x.c.ewm(span=20, adjust=False).mean()
 
     latest = x.iloc[-1]
-    first = x.iloc[0]
-    opening = x.head(min(6, len(x)))
+    today = x[x.session == latest.session]
+    opening = today.head(min(6, len(today)))
+    if opening.empty:
+        opening = x.tail(min(6, len(x)))
     or_high = float(opening.h.max())
-    morning_move = (float(latest.c) / float(first.o) - 1) * 100
+    first_open = float(opening.iloc[0].o)
+    morning_move = (float(latest.c) / first_open - 1) * 100
 
     score = 0
     reasons = []
@@ -132,18 +142,29 @@ def status():
 
 @app.get("/api/scanner")
 async def scanner():
-    if not os.getenv("APCA_API_KEY_ID"):
+    if not (os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_API_KEY")):
         return [{"symbol": s, "price": None, "vwap": None, "rvol": None, "score": 0, "state": "NO DATA", "reason": "Configure Alpaca paper-data credentials on the server"} for s in WATCHLIST]
     out = []
     for symbol in WATCHLIST:
         try:
             x = score_frame(await bars(symbol))
+            if x is None:
+                raise RuntimeError("Not enough bars returned")
             x["symbol"] = symbol
             out.append(x)
+            with db() as c:
+                c.execute("INSERT INTO signals(symbol,price,vwap,rvol,score,state,reason,created_at) VALUES(?,?,?,?,?,?,?,?)", (symbol, x["price"], x["vwap"], x["rvol"], x["score"], x["state"], x["reason"], datetime.now(timezone.utc).isoformat()))
         except Exception as e:
             out.append({"symbol": symbol, "price": None, "vwap": None, "rvol": None, "score": 0, "state": "ERROR", "reason": str(e)})
     out.sort(key=lambda z: z["score"], reverse=True)
     return out
+
+
+@app.get("/api/activity")
+def activity():
+    with db() as c:
+        rows = c.execute("SELECT symbol,price,vwap,rvol,score,state,reason,created_at FROM signals ORDER BY id DESC LIMIT 40").fetchall()
+    return [dict(r) for r in rows]
 
 
 @app.get("/api/positions")
