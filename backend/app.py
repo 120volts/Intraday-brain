@@ -18,7 +18,7 @@ WATCHLIST = ["SPY", "QQQ", "NVDA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "TSL
 PAPER_START = float(os.getenv("PAPER_START", "25000"))
 RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.005"))
 
-app = FastAPI(title="Intraday Brain API", version="0.2.0")
+app = FastAPI(title="Intraday Brain API", version="0.3.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 class PaperTrade(BaseModel):
@@ -59,8 +59,6 @@ def set_setting(key, value):
 
 
 def alpaca_headers():
-    # Accept both the official APCA_* names and the simpler names we used
-    # earlier while setting up the local .env file.
     key = os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_API_KEY")
     secret = os.getenv("APCA_API_SECRET_KEY") or os.getenv("ALPACA_SECRET_KEY")
     if not key or not secret:
@@ -68,9 +66,13 @@ def alpaca_headers():
     return {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
 
 
+def feed():
+    return os.getenv("ALPACA_FEED", "iex")
+
+
 async def bars(symbol: str, limit: int = 100):
     url = f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
-    params = {"timeframe": "5Min", "limit": limit, "feed": os.getenv("ALPACA_FEED", "iex")}
+    params = {"timeframe": "5Min", "limit": limit, "feed": feed(), "sort": "asc"}
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.get(url, headers=alpaca_headers(), params=params)
         r.raise_for_status()
@@ -80,17 +82,59 @@ async def bars(symbol: str, limit: int = 100):
     return pd.DataFrame(data)
 
 
+async def snapshot(symbol: str):
+    url = f"https://data.alpaca.markets/v2/stocks/{symbol}/snapshot"
+    params = {"feed": feed()}
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(url, headers=alpaca_headers(), params=params)
+        r.raise_for_status()
+        return r.json()
+
+
+def snapshot_price(s):
+    trade = s.get("latestTrade") or {}
+    quote = s.get("latestQuote") or {}
+    daily = s.get("dailyBar") or {}
+    prev = s.get("prevDailyBar") or {}
+    price = trade.get("p") or quote.get("ap") or quote.get("bp") or daily.get("c") or prev.get("c")
+    if price is None:
+        return None
+    return float(price)
+
+
+def warmup_result(symbol, s):
+    price = snapshot_price(s)
+    daily = s.get("dailyBar") or {}
+    prev = s.get("prevDailyBar") or {}
+    if price is None:
+        raise RuntimeError("No current snapshot price returned")
+    previous_close = prev.get("c")
+    change_pct = None
+    if previous_close:
+        change_pct = (price / float(previous_close) - 1) * 100
+    return {
+        "symbol": symbol,
+        "price": price,
+        "vwap": float(daily.get("vw")) if daily.get("vw") is not None else None,
+        "rvol": None,
+        "score": 0,
+        "state": "PREMARKET" if not daily else "WARMING UP",
+        "reason": "Live price available; waiting for enough intraday bars to calculate the full setup score",
+        "change_pct": change_pct,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def score_frame(df: pd.DataFrame):
-    if df.empty or len(df) < 20:
+    if df.empty or len(df) < 3:
         return None
     x = df.copy()
     x["t"] = pd.to_datetime(x["t"], utc=True)
     x["session"] = x["t"].dt.date
-    # VWAP resets each trading session instead of accumulating across days.
     x["pv"] = x.c * x.v
-    x["vwap"] = x.groupby("session")["pv"].cumsum() / x.groupby("session")["v"].cumsum()
-    x["vol20"] = x.v.rolling(20).mean()
-    x["rvol"] = x.v / x.vol20
+    x["vwap"] = x.groupby("session")["pv"].cumsum() / x.groupby("session")["v"].cumsum().replace(0, pd.NA)
+    x["vol5"] = x.v.rolling(5, min_periods=2).mean()
+    x["rvol"] = x.v / x.vol5
     x["ema9"] = x.c.ewm(span=9, adjust=False).mean()
     x["ema20"] = x.c.ewm(span=20, adjust=False).mean()
 
@@ -105,7 +149,7 @@ def score_frame(df: pd.DataFrame):
 
     score = 0
     reasons = []
-    if latest.c > latest.vwap:
+    if not pd.isna(latest.vwap) and latest.c > latest.vwap:
         score += 20; reasons.append("above VWAP")
     if latest.ema9 > latest.ema20:
         score += 15; reasons.append("EMA9 > EMA20")
@@ -118,7 +162,7 @@ def score_frame(df: pd.DataFrame):
     if latest.c > latest.o:
         score += 10; reasons.append("green bar")
     state = "SETUP" if score >= 70 else "TREND" if score >= 60 else "WAIT"
-    return {"symbol": None, "price": float(latest.c), "vwap": float(latest.vwap), "rvol": float(latest.rvol) if not pd.isna(latest.rvol) else 0, "score": score, "state": state, "reason": ", ".join(reasons), "updated_at": latest.t.isoformat()}
+    return {"price": float(latest.c), "vwap": float(latest.vwap) if not pd.isna(latest.vwap) else None, "rvol": float(latest.rvol) if not pd.isna(latest.rvol) else None, "score": score, "state": state, "reason": ", ".join(reasons), "updated_at": latest.t.isoformat()}
 
 
 @app.on_event("startup")
@@ -147,16 +191,18 @@ async def scanner():
     out = []
     for symbol in WATCHLIST:
         try:
-            x = score_frame(await bars(symbol))
-            if x is None:
-                raise RuntimeError("Not enough bars returned")
-            x["symbol"] = symbol
+            df = await bars(symbol)
+            scored = score_frame(df)
+            if scored is not None:
+                x = {"symbol": symbol, **scored}
+            else:
+                x = {"symbol": symbol, **warmup_result(symbol, await snapshot(symbol))}
             out.append(x)
             with db() as c:
-                c.execute("INSERT INTO signals(symbol,price,vwap,rvol,score,state,reason,created_at) VALUES(?,?,?,?,?,?,?,?)", (symbol, x["price"], x["vwap"], x["rvol"], x["score"], x["state"], x["reason"], datetime.now(timezone.utc).isoformat()))
+                c.execute("INSERT INTO signals(symbol,price,vwap,rvol,score,state,reason,created_at) VALUES(?,?,?,?,?,?,?,?)", (symbol, x.get("price"), x.get("vwap"), x.get("rvol"), x.get("score", 0), x.get("state"), x.get("reason"), datetime.now(timezone.utc).isoformat()))
         except Exception as e:
             out.append({"symbol": symbol, "price": None, "vwap": None, "rvol": None, "score": 0, "state": "ERROR", "reason": str(e)})
-    out.sort(key=lambda z: z["score"], reverse=True)
+    out.sort(key=lambda z: z.get("score", 0), reverse=True)
     return out
 
 
@@ -193,7 +239,7 @@ def paper_trade(t: PaperTrade):
         open_count = c.execute("SELECT COUNT(*) FROM trades WHERE status='OPEN'").fetchone()[0]
         if open_count >= 2:
             raise HTTPException(409, "Maximum open trades reached")
-        c.execute("INSERT INTO trades(symbol,side,qty,entry,stop,target,score,reason,status,opened_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (t.symbol.upper(), "BUY", t.qty, t.entry, t.stop, t.target, t.score, t.reason, "OPEN", datetime.now(timezone.utc).isoformat()))
+        c.execute("INSERT INTO trades(symbol,side,qty,entry,stop,target,score,reason,status,opened_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (t.symbol.upper(), "BUY", t.qty, t.entry, t.stop, t.target, t.qty, t.score, t.reason, "OPEN", datetime.now(timezone.utc).isoformat()))
         trade_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
     return {"ok": True, "trade_id": trade_id}
 
