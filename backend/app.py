@@ -12,13 +12,12 @@ from pydantic import BaseModel
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
-
 DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "intraday.db")))
 WATCHLIST = ["SPY", "QQQ", "NVDA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "TSLA"]
 PAPER_START = float(os.getenv("PAPER_START", "25000"))
 RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.005"))
 
-app = FastAPI(title="Intraday Brain API", version="0.3.0")
+app = FastAPI(title="Intraday Brain API", version="0.3.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 class PaperTrade(BaseModel):
@@ -31,12 +30,10 @@ class PaperTrade(BaseModel):
     score: int = 0
     reason: str = "manual paper signal"
 
-
 def db():
     c = sqlite3.connect(DB_PATH)
     c.row_factory = sqlite3.Row
     return c
-
 
 def init_db():
     with db() as c:
@@ -46,17 +43,14 @@ def init_db():
         c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('paper_balance', ?)", (str(PAPER_START),))
         c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('paper_mode','on')")
 
-
 def get_setting(key):
     with db() as c:
         row = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     return row[0] if row else None
 
-
 def set_setting(key, value):
     with db() as c:
         c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
-
 
 def alpaca_headers():
     key = os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_API_KEY")
@@ -65,10 +59,8 @@ def alpaca_headers():
         raise RuntimeError("Alpaca API credentials are not configured")
     return {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
 
-
 def feed():
     return os.getenv("ALPACA_FEED", "iex")
-
 
 async def bars(symbol: str, limit: int = 100):
     url = f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
@@ -77,19 +69,14 @@ async def bars(symbol: str, limit: int = 100):
         r = await client.get(url, headers=alpaca_headers(), params=params)
         r.raise_for_status()
         data = r.json().get("bars", [])
-    if not data:
-        return pd.DataFrame()
-    return pd.DataFrame(data)
-
+    return pd.DataFrame(data) if data else pd.DataFrame()
 
 async def snapshot(symbol: str):
     url = f"https://data.alpaca.markets/v2/stocks/{symbol}/snapshot"
-    params = {"feed": feed()}
     async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(url, headers=alpaca_headers(), params=params)
+        r = await client.get(url, headers=alpaca_headers(), params={"feed": feed()})
         r.raise_for_status()
         return r.json()
-
 
 def snapshot_price(s):
     trade = s.get("latestTrade") or {}
@@ -97,10 +84,7 @@ def snapshot_price(s):
     daily = s.get("dailyBar") or {}
     prev = s.get("prevDailyBar") or {}
     price = trade.get("p") or quote.get("ap") or quote.get("bp") or daily.get("c") or prev.get("c")
-    if price is None:
-        return None
-    return float(price)
-
+    return float(price) if price is not None else None
 
 def warmup_result(symbol, s):
     price = snapshot_price(s)
@@ -109,21 +93,8 @@ def warmup_result(symbol, s):
     if price is None:
         raise RuntimeError("No current snapshot price returned")
     previous_close = prev.get("c")
-    change_pct = None
-    if previous_close:
-        change_pct = (price / float(previous_close) - 1) * 100
-    return {
-        "symbol": symbol,
-        "price": price,
-        "vwap": float(daily.get("vw")) if daily.get("vw") is not None else None,
-        "rvol": None,
-        "score": 0,
-        "state": "PREMARKET" if not daily else "WARMING UP",
-        "reason": "Live price available; waiting for enough intraday bars to calculate the full setup score",
-        "change_pct": change_pct,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-
+    change_pct = (price / float(previous_close) - 1) * 100 if previous_close else None
+    return {"symbol": symbol, "price": price, "vwap": float(daily.get("vw")) if daily.get("vw") is not None else None, "rvol": None, "score": 0, "state": "PREMARKET", "reason": "Live price available; waiting for enough intraday bars to calculate the full setup score", "change_pct": change_pct, "updated_at": datetime.now(timezone.utc).isoformat()}
 
 def score_frame(df: pd.DataFrame):
     if df.empty or len(df) < 3:
@@ -137,7 +108,6 @@ def score_frame(df: pd.DataFrame):
     x["rvol"] = x.v / x.vol5
     x["ema9"] = x.c.ewm(span=9, adjust=False).mean()
     x["ema20"] = x.c.ewm(span=20, adjust=False).mean()
-
     latest = x.iloc[-1]
     today = x[x.session == latest.session]
     opening = today.head(min(6, len(today)))
@@ -146,7 +116,6 @@ def score_frame(df: pd.DataFrame):
     or_high = float(opening.h.max())
     first_open = float(opening.iloc[0].o)
     morning_move = (float(latest.c) / first_open - 1) * 100
-
     score = 0
     reasons = []
     if not pd.isna(latest.vwap) and latest.c > latest.vwap:
@@ -164,16 +133,13 @@ def score_frame(df: pd.DataFrame):
     state = "SETUP" if score >= 70 else "TREND" if score >= 60 else "WAIT"
     return {"price": float(latest.c), "vwap": float(latest.vwap) if not pd.isna(latest.vwap) else None, "rvol": float(latest.rvol) if not pd.isna(latest.rvol) else None, "score": score, "state": state, "reason": ", ".join(reasons), "updated_at": latest.t.isoformat()}
 
-
 @app.on_event("startup")
 def startup():
     init_db()
 
-
 @app.get("/api/health")
 def health():
     return {"ok": True, "paper_mode": get_setting("paper_mode") == "on", "time": datetime.now(timezone.utc).isoformat()}
-
 
 @app.get("/api/status")
 def status():
@@ -182,7 +148,6 @@ def status():
         pnl = c.execute("SELECT COALESCE(SUM(pnl),0) FROM trades WHERE status='CLOSED'").fetchone()[0]
         signals = c.execute("SELECT COUNT(*) FROM signals WHERE created_at >= date('now')").fetchone()[0]
     return {"paper_mode": get_setting("paper_mode") == "on", "balance": float(get_setting("paper_balance") or PAPER_START), "today_pnl": float(pnl), "open_trades": open_count, "signals": signals}
-
 
 @app.get("/api/scanner")
 async def scanner():
@@ -193,10 +158,7 @@ async def scanner():
         try:
             df = await bars(symbol)
             scored = score_frame(df)
-            if scored is not None:
-                x = {"symbol": symbol, **scored}
-            else:
-                x = {"symbol": symbol, **warmup_result(symbol, await snapshot(symbol))}
+            x = {"symbol": symbol, **scored} if scored is not None else warmup_result(symbol, await snapshot(symbol))
             out.append(x)
             with db() as c:
                 c.execute("INSERT INTO signals(symbol,price,vwap,rvol,score,state,reason,created_at) VALUES(?,?,?,?,?,?,?,?)", (symbol, x.get("price"), x.get("vwap"), x.get("rvol"), x.get("score", 0), x.get("state"), x.get("reason"), datetime.now(timezone.utc).isoformat()))
@@ -205,13 +167,11 @@ async def scanner():
     out.sort(key=lambda z: z.get("score", 0), reverse=True)
     return out
 
-
 @app.get("/api/activity")
 def activity():
     with db() as c:
         rows = c.execute("SELECT symbol,price,vwap,rvol,score,state,reason,created_at FROM signals ORDER BY id DESC LIMIT 40").fetchall()
     return [dict(r) for r in rows]
-
 
 @app.get("/api/positions")
 def positions():
@@ -219,13 +179,11 @@ def positions():
         rows = c.execute("SELECT * FROM trades WHERE status='OPEN' ORDER BY opened_at DESC").fetchall()
     return [dict(r) for r in rows]
 
-
 @app.get("/api/history")
 def history():
     with db() as c:
         rows = c.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 100").fetchall()
     return [dict(r) for r in rows]
-
 
 @app.post("/api/paper/trade")
 def paper_trade(t: PaperTrade):
@@ -239,10 +197,9 @@ def paper_trade(t: PaperTrade):
         open_count = c.execute("SELECT COUNT(*) FROM trades WHERE status='OPEN'").fetchone()[0]
         if open_count >= 2:
             raise HTTPException(409, "Maximum open trades reached")
-        c.execute("INSERT INTO trades(symbol,side,qty,entry,stop,target,score,reason,status,opened_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (t.symbol.upper(), "BUY", t.qty, t.entry, t.stop, t.target, t.qty, t.score, t.reason, "OPEN", datetime.now(timezone.utc).isoformat()))
+        c.execute("INSERT INTO trades(symbol,side,qty,entry,stop,target,score,reason,status,opened_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (t.symbol.upper(), "BUY", t.qty, t.entry, t.stop, t.target, t.score, t.reason, "OPEN", datetime.now(timezone.utc).isoformat()))
         trade_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
     return {"ok": True, "trade_id": trade_id}
-
 
 @app.post("/api/paper/toggle")
 def paper_toggle():
