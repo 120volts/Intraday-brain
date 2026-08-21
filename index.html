@@ -92,6 +92,7 @@
       <label>Max trades/day <select><option>1</option><option selected>2</option><option>3</option></select></label>
     </div></div>
     <div class="card"><h2>Watchlist</h2><p class="tiny">Comma-separated U.S. stock and ETF symbols. Saving rescans this list.</p><div class="stack"><input id="watchlistInput" aria-label="Watchlist symbols" placeholder="SPY, QQQ, NVDA"><button id="saveWatchlist" class="primary">SAVE WATCHLIST</button></div></div>
+    <div class="card"><div class="row"><h2>Auto paper trading</h2><button id="automationToggle">LOADING</button></div><p class="tiny" id="automationDetail">Scanner checks every five minutes. It can submit only Alpaca paper bracket orders.</p><div class="stack" id="automationEvents"></div></div>
     <div class="card"><h2>Safety</h2><p class="tiny">Real trading is intentionally unavailable in this build. The scanner only reads Alpaca market data and logs signals locally on this Mac.</p></div>
   </section>
 </main>
@@ -137,7 +138,7 @@ function renderBest(){
 function empty(message){ return `<div class="tiny">${message}</div>`; }
 async function load(){
  try {
-   const [status, scanner, positions, history, watchlist]=await Promise.all(["status","scanner","positions","history","watchlist"].map(path=>fetch(`${apiBase}/api/${path}`).then(r=>{if(!r.ok) throw new Error(`${path} unavailable`); return r.json();})));
+   const [status, scanner, positions, history, watchlist, automation]=await Promise.all(["status","scanner","positions","history","watchlist","automation"].map(path=>fetch(`${apiBase}/api/${path}`).then(r=>{if(!r.ok) throw new Error(`${path} unavailable`); return r.json();})));
    document.querySelector("#mode").textContent=status.paper_mode ? "PAPER ON" : "PAPER OFF";
    document.querySelector("#pnl").textContent=`${status.today_pnl >= 0 ? "+" : ""}${money(status.today_pnl)}`;
    document.querySelector("#pnl").className=`value ${status.today_pnl >= 0 ? "positive" : "negative"}`;
@@ -146,6 +147,9 @@ async function load(){
    document.querySelector("#balance").textContent=`Paper balance ${money(status.balance)}`;
    symbols=scanner; selected=scanner[0] || null; render(); renderBest();
    currentWatchlist=watchlist.symbols; document.querySelector("#watchlistInput").value=currentWatchlist.join(", ");
+   document.querySelector("#automationToggle").textContent=automation.enabled ? "AUTO PAPER ON" : "AUTO PAPER OFF";
+   document.querySelector("#automationDetail").textContent=`Every ${automation.interval_seconds / 60} minutes: score ${automation.minimum_score}+ only, 0.5% risk, ${automation.target_r}R target, maximum 2 positions.`;
+   document.querySelector("#automationEvents").innerHTML=automation.events.length ? automation.events.slice(0,5).map(event=>`<div class="tiny">${event.event}${event.symbol ? ` · ${event.symbol}` : ""} · ${event.detail}</div>`).join("") : empty("Automation is disarmed. No paper orders can be submitted.");
    document.querySelector("#positions").innerHTML=positions.length ? positions.map(x=>`<div class="ticker"><div class="row"><strong>${x.symbol} · ${x.side}</strong><button data-close="${x.id}">CLOSE</button></div><div class="tiny">${x.qty} shares · Entry ${money(x.entry)} · Stop ${money(x.stop)} · Target ${money(x.target)}</div></div>`).join("") : empty("No open paper positions.");
    document.querySelectorAll("[data-close]").forEach(button=>button.addEventListener("click",()=>closeTrade(button.dataset.close)));
    document.querySelector("#history").innerHTML=history.length ? history.map(x=>`<div class="ticker"><div class="row"><strong>${x.symbol} · ${x.side}</strong><span>${x.status}</span></div><div class="tiny">${x.opened_at || "—"} · P/L ${money(x.pnl)}</div></div>`).join("") : empty("No paper-trade history yet.");
@@ -169,6 +173,9 @@ document.getElementById("paperTrade").addEventListener("submit",async event=>{
 document.getElementById("saveWatchlist").addEventListener("click",async()=>{
  const symbols=document.querySelector("#watchlistInput").value.split(",").map(symbol=>symbol.trim()).filter(Boolean);
  try { const response=await fetch(`${apiBase}/api/watchlist`,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({symbols})}); const result=await response.json(); if(!response.ok) throw new Error(result.detail || "Watchlist was rejected"); document.querySelector("#message").textContent=`Saved ${result.symbols.length} symbols. Refreshing scanner.`; await load(); } catch(error) { document.querySelector("#message").textContent=error.message; }
+});
+document.getElementById("automationToggle").addEventListener("click",async()=>{
+ try { const response=await fetch(`${apiBase}/api/automation/toggle`,{method:"POST"}); const result=await response.json(); if(!response.ok) throw new Error(result.detail || "Automation change was rejected"); document.querySelector("#message").textContent=result.enabled ? "Auto paper trading armed. The next scan can submit qualifying Alpaca paper orders." : "Auto paper trading disarmed."; await load(); } catch(error) { document.querySelector("#message").textContent=error.message; }
 });
 async function closeTrade(tradeId){
  const exit=Number(window.prompt("Paper exit price"));

@@ -1,6 +1,8 @@
 import os
 import json
 import re
+import asyncio
+import math
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,10 +21,14 @@ DB_PATH = Path(os.getenv("DB_PATH", "intraday.db"))
 WATCHLIST = ["SPY", "QQQ", "NVDA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "TSLA"]
 PAPER_START = float(os.getenv("PAPER_START", "25000"))
 RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.005"))
+AUTO_MIN_SCORE = int(os.getenv("AUTO_MIN_SCORE", "70"))
+AUTO_TARGET_R = float(os.getenv("AUTO_TARGET_R", "2"))
+AUTO_INTERVAL_SECONDS = int(os.getenv("AUTO_INTERVAL_SECONDS", "300"))
 
 app = FastAPI(title="Intraday Brain API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 scanner_cache = {"created_at": None, "data": None}
+automation_task = None
 
 class PaperTrade(BaseModel):
     symbol: str
@@ -54,9 +60,14 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         c.execute("CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, side TEXT, qty INTEGER, entry REAL, exit REAL, stop REAL, target REAL, score INTEGER, reason TEXT, status TEXT, opened_at TEXT, closed_at TEXT, pnl REAL DEFAULT 0)")
         c.execute("CREATE TABLE IF NOT EXISTS signals (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, price REAL, vwap REAL, rvol REAL, score INTEGER, state TEXT, reason TEXT, created_at TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS automation_events (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, event TEXT, detail TEXT, created_at TEXT)")
         c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('paper_balance', ?)", (str(PAPER_START),))
         c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('paper_mode','on')")
         c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('watchlist', ?)", (json.dumps(WATCHLIST),))
+        c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('auto_paper_enabled','off')")
+        columns = [row[1] for row in c.execute("PRAGMA table_info(trades)")]
+        if "broker_order_id" not in columns:
+            c.execute("ALTER TABLE trades ADD COLUMN broker_order_id TEXT")
 
 
 def get_setting(key):
@@ -83,6 +94,11 @@ def clear_scanner_cache():
     scanner_cache["data"] = None
 
 
+def log_automation(symbol, event, detail):
+    with db() as c:
+        c.execute("INSERT INTO automation_events(symbol,event,detail,created_at) VALUES(?,?,?,?)", (symbol, event, detail, datetime.now(timezone.utc).isoformat()))
+
+
 def alpaca_headers():
     key = os.getenv("APCA_API_KEY_ID")
     secret = os.getenv("APCA_API_SECRET_KEY")
@@ -101,6 +117,14 @@ async def bars(symbol: str, limit: int = 100):
     if not data:
         return pd.DataFrame()
     return pd.DataFrame(data)
+
+
+async def submit_paper_bracket(symbol, qty, entry, stop, target):
+    payload = {"symbol": symbol, "qty": str(qty), "side": "buy", "type": "market", "time_in_force": "day", "order_class": "bracket", "take_profit": {"limit_price": str(round(target, 2))}, "stop_loss": {"stop_price": str(round(stop, 2))}}
+    async with httpx.AsyncClient(timeout=15) as client:
+        response = await client.post("https://paper-api.alpaca.markets/v2/orders", headers=alpaca_headers(), json=payload)
+        response.raise_for_status()
+        return response.json()
 
 
 def score_frame(df: pd.DataFrame):
@@ -153,8 +177,26 @@ def log_signals(rows):
 
 
 @app.on_event("startup")
-def startup():
+async def startup():
+    global automation_task
     init_db()
+    automation_task = asyncio.create_task(automation_loop())
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    if automation_task:
+        automation_task.cancel()
+
+
+async def automation_loop():
+    while True:
+        try:
+            if get_setting("auto_paper_enabled") == "on":
+                await run_automation()
+        except Exception as error:
+            log_automation(None, "ERROR", str(error))
+        await asyncio.sleep(AUTO_INTERVAL_SECONDS)
 
 
 @app.get("/api/health")
@@ -165,10 +207,27 @@ def health():
 @app.get("/api/status")
 def status():
     with db() as c:
-        open_count = c.execute("SELECT COUNT(*) FROM trades WHERE status='OPEN'").fetchone()[0]
+        open_count = c.execute("SELECT COUNT(*) FROM trades WHERE status IN ('OPEN','SUBMITTED')").fetchone()[0]
         pnl = c.execute("SELECT COALESCE(SUM(pnl),0) FROM trades WHERE status='CLOSED'").fetchone()[0]
         signals = c.execute("SELECT COUNT(*) FROM signals WHERE created_at >= date('now')").fetchone()[0]
     return {"paper_mode": get_setting("paper_mode") == "on", "balance": float(get_setting("paper_balance") or PAPER_START), "today_pnl": float(pnl), "open_trades": open_count, "signals": signals}
+
+
+@app.get("/api/automation")
+def automation_status():
+    with db() as c:
+        events = [dict(row) for row in c.execute("SELECT * FROM automation_events ORDER BY id DESC LIMIT 20")]
+    return {"enabled": get_setting("auto_paper_enabled") == "on", "interval_seconds": AUTO_INTERVAL_SECONDS, "minimum_score": AUTO_MIN_SCORE, "target_r": AUTO_TARGET_R, "events": events}
+
+
+@app.post("/api/automation/toggle")
+def toggle_automation():
+    if not os.getenv("APCA_API_KEY_ID") or not os.getenv("APCA_API_SECRET_KEY"):
+        raise HTTPException(409, "Alpaca paper-trading credentials are required")
+    enabled = get_setting("auto_paper_enabled") != "on"
+    set_setting("auto_paper_enabled", "on" if enabled else "off")
+    log_automation(None, "ARMED" if enabled else "DISARMED", "Paper automation toggled")
+    return {"enabled": enabled}
 
 
 @app.get("/api/watchlist")
@@ -217,10 +276,40 @@ async def scanner():
     return out
 
 
+async def run_automation():
+    rows = await scanner()
+    with db() as c:
+        active = c.execute("SELECT symbol FROM trades WHERE status IN ('OPEN','SUBMITTED')").fetchall()
+    active_symbols = {row["symbol"] for row in active}
+    slots = max(0, 2 - len(active_symbols))
+    for row in rows:
+        if not slots:
+            return
+        if row["symbol"] in active_symbols or row["score"] < AUTO_MIN_SCORE or row["price"] is None or row["vwap"] is None:
+            continue
+        entry = row["price"]
+        stop = min(row["vwap"], entry * 0.99)
+        risk_per_share = entry - stop
+        qty = math.floor((PAPER_START * RISK_PER_TRADE) / risk_per_share) if risk_per_share > 0 else 0
+        if not qty:
+            log_automation(row["symbol"], "SKIPPED", "Unable to calculate a positive share quantity")
+            continue
+        target = entry + risk_per_share * AUTO_TARGET_R
+        try:
+            order = await submit_paper_bracket(row["symbol"], qty, entry, stop, target)
+            with db() as c:
+                c.execute("INSERT INTO trades(symbol,side,qty,entry,stop,target,score,reason,status,opened_at,broker_order_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (row["symbol"], "BUY", qty, entry, stop, target, row["score"], row["reason"], "SUBMITTED", datetime.now(timezone.utc).isoformat(), order["id"]))
+            log_automation(row["symbol"], "SUBMITTED", f"Alpaca paper bracket order {order['id']}")
+            active_symbols.add(row["symbol"])
+            slots -= 1
+        except Exception as error:
+            log_automation(row["symbol"], "REJECTED", str(error))
+
+
 @app.get("/api/positions")
 def positions():
     with db() as c:
-        rows = c.execute("SELECT * FROM trades WHERE status='OPEN' ORDER BY opened_at DESC").fetchall()
+        rows = c.execute("SELECT * FROM trades WHERE status IN ('OPEN','SUBMITTED') ORDER BY opened_at DESC").fetchall()
     return [dict(r) for r in rows]
 
 
