@@ -13,6 +13,8 @@ This is the server-side paper-trading API for the iPhone dashboard.
 - Position/history/status endpoints
 - Docker image
 
+The scanner reads data only. It does not submit Alpaca orders, and there is no Fidelity integration.
+
 ## Run locally
 
 ```bash
@@ -26,6 +28,15 @@ uvicorn app:app --reload --port 8000
 ```
 
 The API will be available at `http://localhost:8000`.
+
+## Dashboard endpoints
+
+- `GET /api/status` returns paper-mode state and local paper-account metrics.
+- `GET /api/scanner` fetches and scores the watchlist, caching each scan for five minutes and logging the resulting signals to SQLite.
+- `GET /api/positions` returns locally recorded open paper positions.
+- `GET /api/history` returns locally recorded paper-trade history.
+
+Use `http://localhost:8000/docs` on the Mac to inspect and test the API. Credentials stay only in `backend/.env`, which is ignored by Git.
 
 ## Data provider
 

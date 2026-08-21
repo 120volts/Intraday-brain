@@ -10,7 +10,9 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from dotenv import load_dotenv
 
+load_dotenv()
 DB_PATH = Path(os.getenv("DB_PATH", "intraday.db"))
 WATCHLIST = ["SPY", "QQQ", "NVDA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "TSLA"]
 PAPER_START = float(os.getenv("PAPER_START", "25000"))
@@ -18,6 +20,7 @@ RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.005"))
 
 app = FastAPI(title="Intraday Brain API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+scanner_cache = {"created_at": None, "data": None}
 
 class PaperTrade(BaseModel):
     symbol: str
@@ -108,7 +111,21 @@ def score_frame(df: pd.DataFrame):
     if latest.c > latest.o:
         score += 10; reasons.append("green bar")
     state = "SETUP" if score >= 70 else "TREND" if score >= 60 else "WAIT"
-    return {"symbol": None, "price": float(latest.c), "vwap": float(latest.vwap), "rvol": float(latest.rvol) if not pd.isna(latest.rvol) else 0, "score": score, "state": state, "reason": ", ".join(reasons), "updated_at": latest.t.isoformat()}
+    return {"symbol": None, "price": float(latest.c), "vwap": float(latest.vwap), "rvol": float(latest.rvol) if not pd.isna(latest.rvol) else 0, "score": score, "state": state, "reason": ", ".join(reasons) or "No qualifying conditions", "updated_at": latest.t.isoformat()}
+
+
+def cache_is_fresh():
+    created_at = scanner_cache["created_at"]
+    return created_at and (datetime.now(timezone.utc) - created_at).total_seconds() < 300
+
+
+def log_signals(rows):
+    created_at = datetime.now(timezone.utc).isoformat()
+    with db() as c:
+        c.executemany(
+            "INSERT INTO signals(symbol,price,vwap,rvol,score,state,reason,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            [(row["symbol"], row["price"], row["vwap"], row["rvol"], row["score"], row["state"], row["reason"], created_at) for row in rows],
+        )
 
 
 @app.on_event("startup")
@@ -132,17 +149,24 @@ def status():
 
 @app.get("/api/scanner")
 async def scanner():
+    if cache_is_fresh():
+        return scanner_cache["data"]
     if not os.getenv("APCA_API_KEY_ID"):
         return [{"symbol": s, "price": None, "vwap": None, "rvol": None, "score": 0, "state": "NO DATA", "reason": "Configure Alpaca paper-data credentials on the server"} for s in WATCHLIST]
     out = []
     for symbol in WATCHLIST:
         try:
             x = score_frame(await bars(symbol))
+            if x is None:
+                raise ValueError("Not enough 5-minute bars returned")
             x["symbol"] = symbol
             out.append(x)
         except Exception as e:
             out.append({"symbol": symbol, "price": None, "vwap": None, "rvol": None, "score": 0, "state": "ERROR", "reason": str(e)})
     out.sort(key=lambda z: z["score"], reverse=True)
+    log_signals(out)
+    scanner_cache["created_at"] = datetime.now(timezone.utc)
+    scanner_cache["data"] = out
     return out
 
 

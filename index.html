@@ -38,25 +38,25 @@
 
   <section id="dashboard" class="page active">
     <div class="grid4">
-      <div class="card metric"><div class="label">Today P/L</div><div class="value positive" id="pnl">+$184.20</div><div class="tiny">+0.74%</div></div>
-      <div class="card metric"><div class="label">Signals</div><div class="value" id="signals">3</div><div class="tiny">1 actionable</div></div>
-      <div class="card metric"><div class="label">Open trades</div><div class="value">1</div><div class="tiny">$42 risk</div></div>
-      <div class="card metric"><div class="label">Risk / trade</div><div class="value">0.50%</div><div class="tiny">$125 max</div></div>
+      <div class="card metric"><div class="label">Today P/L</div><div class="value" id="pnl">—</div><div class="tiny">Closed paper trades</div></div>
+      <div class="card metric"><div class="label">Signals</div><div class="value" id="signals">—</div><div class="tiny">Logged today</div></div>
+      <div class="card metric"><div class="label">Open trades</div><div class="value" id="openTrades">—</div><div class="tiny">Paper positions</div></div>
+      <div class="card metric"><div class="label">Risk / trade</div><div class="value">0.50%</div><div class="tiny" id="balance">—</div></div>
     </div>
 
     <div class="card"><div class="row"><h2>Scanner</h2><span class="tiny" id="updated">Updated just now</span></div><div class="stack" id="scanner" style="margin-top:10px"></div></div>
 
     <div class="card">
-      <div class="row"><h2>Best setup</h2><span class="pill good">84/100</span></div>
+      <div class="row"><h2>Best setup</h2><span class="pill" id="bestScore">—</span></div>
       <div class="two" style="margin-top:12px">
         <div><div class="label">Symbol</div><strong id="bestSymbol">NVDA</strong></div>
-        <div><div class="label">Setup</div><strong>VWAP reclaim</strong></div>
-        <div><div class="label">Entry zone</div><strong>$181.80–182.30</strong></div>
-        <div><div class="label">Invalidation</div><strong>$179.90</strong></div>
-        <div><div class="label">Target</div><strong>$186.10</strong></div>
-        <div><div class="label">Reward / risk</div><strong>2.2R</strong></div>
+        <div><div class="label">Setup</div><strong id="bestState">—</strong></div>
+        <div><div class="label">Last price</div><strong id="bestPrice">—</strong></div>
+        <div><div class="label">VWAP</div><strong id="bestVwap">—</strong></div>
+        <div><div class="label">Relative volume</div><strong id="bestRvol">—</strong></div>
+        <div><div class="label">Reason</div><strong id="bestReason">—</strong></div>
       </div>
-      <button class="primary" id="paperTrade" style="width:100%;margin-top:14px">SIMULATE PAPER TRADE</button>
+      <button class="primary" id="paperTrade" style="width:100%;margin-top:14px">PAPER EXECUTION DISABLED</button>
       <div class="tiny" id="message" aria-live="polite" style="margin-top:9px"></div>
     </div>
   </section>
@@ -66,9 +66,7 @@
   </section>
 
   <section id="positionsPage" class="page">
-    <div class="card"><h2>Paper positions</h2><div class="stack" style="margin-top:12px">
-      <div class="ticker"><div class="row"><strong>NVDA · LONG</strong><span class="good">+$42.80</span></div><div class="tiny">Entry $181.92 · Stop $179.90 · Target $186.10</div><div class="progress"><div class="bar" style="width:54%"></div></div></div>
-    </div></div>
+    <div class="card"><h2>Paper positions</h2><div class="stack" id="positions" style="margin-top:12px"></div></div>
     <div class="card"><h2>Risk controls</h2><div class="stack" style="margin-top:12px">
       <div class="row"><span>Max risk / trade</span><strong>0.50%</strong></div>
       <div class="row"><span>Max daily loss</span><strong>1.50%</strong></div>
@@ -87,7 +85,7 @@
       <label>Opening range <select><option>15 minutes</option><option selected>30 minutes</option><option>45 minutes</option></select></label>
       <label>Max trades/day <select><option>1</option><option selected>2</option><option>3</option></select></label>
     </div></div>
-    <div class="card"><h2>Safety</h2><p class="tiny">Real trading is intentionally unavailable in this build. When execution is eventually added, it will require a separate explicit live-mode control and broker authorization.</p><button class="danger" id="reset">Reset demo data</button></div>
+    <div class="card"><h2>Safety</h2><p class="tiny">Real trading is intentionally unavailable in this build. The scanner only reads Alpaca market data and logs signals locally on this Mac.</p></div>
   </section>
 </main>
 
@@ -100,30 +98,49 @@
 </nav>
 
 <script>
-const symbols=[
- {s:"NVDA",p:"+2.31%",state:"SETUP",score:84},
- {s:"QQQ",p:"+1.14%",state:"TREND",score:76},
- {s:"SPY",p:"+0.82%",state:"TREND",score:71},
- {s:"AMZN",p:"+1.02%",state:"SETUP",score:69},
- {s:"TSLA",p:"+1.72%",state:"VOLATILE",score:63},
- {s:"MSFT",p:"+0.44%",state:"WAIT",score:58},
- {s:"META",p:"+0.27%",state:"WAIT",score:51},
- {s:"AAPL",p:"-0.18%",state:"WAIT",score:43},
- {s:"GOOGL",p:"-0.32%",state:"WEAK",score:37}
-];
+const apiBase = new URLSearchParams(location.search).get("api") || localStorage.getItem("intradayApiBase") || `${location.protocol}//${location.hostname}:8000`;
+let symbols=[];
+let selected=null;
+const money=value => value == null ? "—" : new Intl.NumberFormat("en-US", {style:"currency",currency:"USD"}).format(value);
 function card(x){
  const cls=x.state==="SETUP"||x.state==="TREND"?"good":x.state==="WEAK"?"bad":"warn";
- return `<button class="ticker" data-s="${x.s}"><div class="row"><strong>${x.s}</strong><span>${x.p}</span></div><div class="row" style="margin-top:5px"><small>${x.state}</small><small class="${cls}">score ${x.score}</small></div><div class="progress"><div class="bar" style="width:${x.score}%"></div></div></button>`;
+ return `<button class="ticker" data-s="${x.symbol}"><div class="row"><strong>${x.symbol}</strong><span>${money(x.price)}</span></div><div class="row" style="margin-top:5px"><small>${x.state}</small><small class="${cls}">score ${x.score}</small></div><div class="progress"><div class="bar" style="width:${x.score}%"></div></div></button>`;
 }
 function render(){
  document.querySelector("#scanner").innerHTML=symbols.slice(0,5).map(card).join("");
  document.querySelector("#scannerFull").innerHTML=symbols.map(card).join("");
  document.querySelectorAll("[data-s]").forEach(b=>b.addEventListener("click",()=>{
-   document.querySelector("#bestSymbol").textContent=b.dataset.s;
-   document.querySelector("#message").textContent=`${b.dataset.s} selected. Live market data will be connected to the server backend.`;
+   selected=symbols.find(x=>x.symbol===b.dataset.s); renderBest();
  }));
 }
-render();
+function renderBest(){
+ if(!selected) return;
+ document.querySelector("#bestSymbol").textContent=selected.symbol;
+ document.querySelector("#bestScore").textContent=`${selected.score}/100`;
+ document.querySelector("#bestState").textContent=selected.state;
+ document.querySelector("#bestPrice").textContent=money(selected.price);
+ document.querySelector("#bestVwap").textContent=money(selected.vwap);
+ document.querySelector("#bestRvol").textContent=selected.rvol == null ? "—" : `${selected.rvol.toFixed(2)}×`;
+ document.querySelector("#bestReason").textContent=selected.reason;
+ document.querySelector("#message").textContent=`${selected.symbol} selected from the live scanner. Execution remains disabled.`;
+}
+function empty(message){ return `<div class="tiny">${message}</div>`; }
+async function load(){
+ try {
+   const [status, scanner, positions, history]=await Promise.all(["status","scanner","positions","history"].map(path=>fetch(`${apiBase}/api/${path}`).then(r=>{if(!r.ok) throw new Error(`${path} unavailable`); return r.json();})));
+   document.querySelector("#mode").textContent=status.paper_mode ? "PAPER ON" : "PAPER OFF";
+   document.querySelector("#pnl").textContent=`${status.today_pnl >= 0 ? "+" : ""}${money(status.today_pnl)}`;
+   document.querySelector("#pnl").className=`value ${status.today_pnl >= 0 ? "positive" : "negative"}`;
+   document.querySelector("#signals").textContent=status.signals;
+   document.querySelector("#openTrades").textContent=status.open_trades;
+   document.querySelector("#balance").textContent=`Paper balance ${money(status.balance)}`;
+   symbols=scanner; selected=scanner[0] || null; render(); renderBest();
+   document.querySelector("#positions").innerHTML=positions.length ? positions.map(x=>`<div class="ticker"><strong>${x.symbol} · ${x.side}</strong><div class="tiny">Entry ${money(x.entry)} · Stop ${money(x.stop)} · Target ${money(x.target)}</div></div>`).join("") : empty("No open paper positions.");
+   document.querySelector("#history").innerHTML=history.length ? history.map(x=>`<div class="ticker"><div class="row"><strong>${x.symbol} · ${x.side}</strong><span>${x.status}</span></div><div class="tiny">${x.opened_at || "—"} · P/L ${money(x.pnl)}</div></div>`).join("") : empty("No paper-trade history yet.");
+   document.querySelector("#updated").textContent=`Updated ${new Date().toLocaleTimeString([], {hour:"numeric",minute:"2-digit"})}`;
+ } catch(error) { document.querySelector("#message").textContent=`Cannot reach the scanner at ${apiBase}. Start the FastAPI server, then refresh.`; document.querySelector("#scanner").innerHTML=empty("Scanner unavailable."); }
+}
+load();
 
 document.querySelectorAll(".nav button").forEach(btn=>btn.addEventListener("click",()=>{
  document.querySelectorAll(".nav button").forEach(b=>b.classList.remove("active"));
@@ -132,19 +149,8 @@ document.querySelectorAll(".nav button").forEach(btn=>btn.addEventListener("clic
  document.getElementById(btn.dataset.page).classList.add("active");
 }));
 
-document.getElementById("mode").addEventListener("click",e=>{
- const on=e.target.textContent==="PAPER ON";
- e.target.textContent=on?"PAPER OFF":"PAPER ON";
- document.getElementById("message").textContent=on?"Paper trading paused.":"Paper trading enabled.";
-});
 document.getElementById("paperTrade").addEventListener("click",()=>{
- document.getElementById("message").textContent="Paper order simulated for NVDA. No real order was sent.";
- const h=document.getElementById("history");
- h.insertAdjacentHTML("afterbegin",`<div class="ticker"><div class="row"><strong>NVDA · PAPER LONG</strong><span class="good">OPEN</span></div><div class="tiny">Simulated just now · risk $125 · target 2.2R</div></div>`);
-});
-document.getElementById("reset").addEventListener("click",()=>{
- document.getElementById("message").textContent="Demo state reset.";
- document.getElementById("history").innerHTML="";
+ document.getElementById("message").textContent="Paper execution is intentionally disabled while the scanner is being verified.";
 });
 </script>
 </body>
