@@ -1,10 +1,10 @@
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timezone, time as dtime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
-import pandas as pd
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,9 +16,16 @@ DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "intraday.db")))
 WATCHLIST = ["SPY", "QQQ", "NVDA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "TSLA"]
 PAPER_START = float(os.getenv("PAPER_START", "25000"))
 RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.005"))
+ET = ZoneInfo("America/New_York")
 
-app = FastAPI(title="Intraday Brain API", version="0.3.1")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app = FastAPI(title="Intraday Brain API", version="0.4.0")
+# GitHub Pages hosts the phone dashboard. Keep this explicit rather than relying on browser defaults.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://120volts.github.io", "http://localhost", "http://127.0.0.1"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 class PaperTrade(BaseModel):
     symbol: str
@@ -56,82 +63,138 @@ def alpaca_headers():
     key = os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_API_KEY")
     secret = os.getenv("APCA_API_SECRET_KEY") or os.getenv("ALPACA_SECRET_KEY")
     if not key or not secret:
-        raise RuntimeError("Alpaca API credentials are not configured")
+        return None
     return {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
 
-def feed():
-    return os.getenv("ALPACA_FEED", "iex")
-
-async def bars(symbol: str, limit: int = 100):
-    url = f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
-    params = {"timeframe": "5Min", "limit": limit, "feed": feed(), "sort": "asc"}
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(url, headers=alpaca_headers(), params=params)
+async def yahoo_chart(symbol: str, interval: str = "5m", range_: str = "1d"):
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {"interval": interval, "range": range_, "includePrePost": "true", "events": "div,splits"}
+    async with httpx.AsyncClient(timeout=15, headers={"User-Agent": "Mozilla/5.0"}) as client:
+        r = await client.get(url, params=params)
         r.raise_for_status()
-        data = r.json().get("bars", [])
-    return pd.DataFrame(data) if data else pd.DataFrame()
+        payload = r.json()
+    result = (payload.get("chart") or {}).get("result") or []
+    if not result:
+        raise RuntimeError("Yahoo returned no chart data")
+    return result[0]
 
-async def snapshot(symbol: str):
-    url = f"https://data.alpaca.markets/v2/stocks/{symbol}/snapshot"
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(url, headers=alpaca_headers(), params={"feed": feed()})
-        r.raise_for_status()
-        return r.json()
+def yahoo_rows(result):
+    ts = result.get("timestamp") or []
+    q = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+    rows = []
+    for i, stamp in enumerate(ts):
+        def val(name):
+            arr = q.get(name) or []
+            return arr[i] if i < len(arr) else None
+        close = val("close")
+        if close is None:
+            continue
+        rows.append({
+            "t": datetime.fromtimestamp(stamp, timezone.utc).isoformat(),
+            "ts": stamp,
+            "o": val("open"), "h": val("high"), "l": val("low"),
+            "c": close, "v": val("volume") or 0,
+        })
+    return rows
 
-def snapshot_price(s):
-    trade = s.get("latestTrade") or {}
-    quote = s.get("latestQuote") or {}
-    daily = s.get("dailyBar") or {}
-    prev = s.get("prevDailyBar") or {}
-    price = trade.get("p") or quote.get("ap") or quote.get("bp") or daily.get("c") or prev.get("c")
-    return float(price) if price is not None else None
+def is_regular(ts):
+    dt = datetime.fromtimestamp(ts, ET)
+    return dt.weekday() < 5 and dtime(9, 30) <= dt.time() < dtime(16, 0)
 
-def warmup_result(symbol, s):
-    price = snapshot_price(s)
-    daily = s.get("dailyBar") or {}
-    prev = s.get("prevDailyBar") or {}
-    if price is None:
-        raise RuntimeError("No current snapshot price returned")
-    previous_close = prev.get("c")
-    change_pct = (price / float(previous_close) - 1) * 100 if previous_close else None
-    return {"symbol": symbol, "price": price, "vwap": float(daily.get("vw")) if daily.get("vw") is not None else None, "rvol": None, "score": 0, "state": "PREMARKET", "reason": "Live price available; waiting for enough intraday bars to calculate the full setup score", "change_pct": change_pct, "updated_at": datetime.now(timezone.utc).isoformat()}
-
-def score_frame(df: pd.DataFrame):
-    if df.empty or len(df) < 3:
+def ema(values, span):
+    if not values:
         return None
-    x = df.copy()
-    x["t"] = pd.to_datetime(x["t"], utc=True)
-    x["session"] = x["t"].dt.date
-    x["pv"] = x.c * x.v
-    x["vwap"] = x.groupby("session")["pv"].cumsum() / x.groupby("session")["v"].cumsum().replace(0, pd.NA)
-    x["vol5"] = x.v.rolling(5, min_periods=2).mean()
-    x["rvol"] = x.v / x.vol5
-    x["ema9"] = x.c.ewm(span=9, adjust=False).mean()
-    x["ema20"] = x.c.ewm(span=20, adjust=False).mean()
-    latest = x.iloc[-1]
-    today = x[x.session == latest.session]
-    opening = today.head(min(6, len(today)))
-    if opening.empty:
-        opening = x.tail(min(6, len(x)))
-    or_high = float(opening.h.max())
-    first_open = float(opening.iloc[0].o)
-    morning_move = (float(latest.c) / first_open - 1) * 100
+    alpha = 2 / (span + 1)
+    e = float(values[0])
+    for v in values[1:]:
+        e = alpha * float(v) + (1 - alpha) * e
+    return e
+
+def enrich(rows):
+    regular = [r for r in rows if r.get("c") is not None and is_regular(r["ts"])]
+    if not regular:
+        return rows, []
+    cumulative_pv = 0.0
+    cumulative_vol = 0.0
+    closes = []
+    volumes = []
+    enriched = []
+    session = None
+    for r in regular:
+        dt = datetime.fromtimestamp(r["ts"], ET)
+        day = dt.date()
+        if day != session:
+            session = day
+            cumulative_pv = 0.0
+            cumulative_vol = 0.0
+            closes = []
+            volumes = []
+        typical = (float(r["h"]) + float(r["l"]) + float(r["c"])) / 3
+        cumulative_pv += typical * float(r["v"])
+        cumulative_vol += float(r["v"])
+        closes.append(float(r["c"]))
+        volumes.append(float(r["v"]))
+        r = dict(r)
+        r["vwap"] = cumulative_pv / cumulative_vol if cumulative_vol else float(r["c"])
+        r["ema9"] = ema(closes, 9)
+        r["ema20"] = ema(closes, 20)
+        prior = volumes[-21:-1]
+        avg_vol = sum(prior) / len(prior) if prior else None
+        r["rvol"] = float(r["v"]) / avg_vol if avg_vol and avg_vol > 0 else None
+        r["et"] = dt.strftime("%H:%M")
+        enriched.append(r)
+    return rows, enriched
+
+def score_rows(enriched):
+    if not enriched:
+        return None
+    latest = enriched[-1]
+    today = datetime.fromtimestamp(latest["ts"], ET).date()
+    today_rows = [r for r in enriched if datetime.fromtimestamp(r["ts"], ET).date() == today]
+    opening = today_rows[:6]
+    if not opening:
+        opening = today_rows
+    or_high = max(float(r["h"]) for r in opening)
+    first_open = float(opening[0]["o"])
+    c = float(latest["c"])
     score = 0
     reasons = []
-    if not pd.isna(latest.vwap) and latest.c > latest.vwap:
-        score += 20; reasons.append("above VWAP")
-    if latest.ema9 > latest.ema20:
-        score += 15; reasons.append("EMA9 > EMA20")
-    if float(latest.rvol or 0) >= 1.25:
-        score += 20; reasons.append("relative volume")
-    if latest.c >= or_high:
-        score += 15; reasons.append("opening-range strength")
-    if morning_move >= 1:
-        score += 15; reasons.append("morning expansion")
-    if latest.c > latest.o:
-        score += 10; reasons.append("green bar")
+    if c > float(latest["vwap"]): score += 20; reasons.append("above VWAP")
+    if latest["ema9"] > latest["ema20"]: score += 15; reasons.append("EMA9 > EMA20")
+    if latest["rvol"] is not None and latest["rvol"] >= 1.25: score += 20; reasons.append("relative volume")
+    if c >= or_high: score += 15; reasons.append("opening-range strength")
+    if c / first_open - 1 >= 0.01: score += 15; reasons.append("morning expansion")
+    if c > float(latest["o"]): score += 10; reasons.append("green bar")
     state = "SETUP" if score >= 70 else "TREND" if score >= 60 else "WAIT"
-    return {"price": float(latest.c), "vwap": float(latest.vwap) if not pd.isna(latest.vwap) else None, "rvol": float(latest.rvol) if not pd.isna(latest.rvol) else None, "score": score, "state": state, "reason": ", ".join(reasons), "updated_at": latest.t.isoformat()}
+    return {
+        "price": c, "vwap": float(latest["vwap"]), "rvol": latest["rvol"],
+        "ema9": float(latest["ema9"]), "ema20": float(latest["ema20"]),
+        "opening_range_high": or_high, "score": score, "state": state,
+        "reason": ", ".join(reasons) or "No qualifying setup conditions yet",
+        "bar_time": latest["t"], "source": "Yahoo Finance",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+def yahoo_price(result, rows):
+    meta = result.get("meta") or {}
+    price = meta.get("regularMarketPrice")
+    now = datetime.now(ET).time()
+    if now < dtime(9, 30):
+        price = meta.get("preMarketPrice") or price
+    elif now >= dtime(16, 0):
+        price = meta.get("postMarketPrice") or price
+    if price is None and rows:
+        price = rows[-1].get("c")
+    return float(price) if price is not None else None
+
+def warmup(symbol, result, rows):
+    price = yahoo_price(result, rows)
+    if price is None:
+        raise RuntimeError("Yahoo returned no current price")
+    meta = result.get("meta") or {}
+    prev = meta.get("previousClose") or meta.get("chartPreviousClose")
+    change_pct = (price / float(prev) - 1) * 100 if prev else None
+    return {"symbol": symbol, "price": price, "vwap": None, "rvol": None, "ema9": None, "ema20": None, "opening_range_high": None, "score": 0, "state": "WARMING UP", "reason": "Price available; waiting for enough regular-session bars to calculate the setup", "change_pct": change_pct, "source": "Yahoo Finance", "updated_at": datetime.now(timezone.utc).isoformat()}
 
 @app.on_event("startup")
 def startup():
@@ -151,21 +214,30 @@ def status():
 
 @app.get("/api/scanner")
 async def scanner():
-    if not (os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_API_KEY")):
-        return [{"symbol": s, "price": None, "vwap": None, "rvol": None, "score": 0, "state": "NO DATA", "reason": "Configure Alpaca paper-data credentials on the server"} for s in WATCHLIST]
     out = []
     for symbol in WATCHLIST:
         try:
-            df = await bars(symbol)
-            scored = score_frame(df)
-            x = {"symbol": symbol, **scored} if scored is not None else warmup_result(symbol, await snapshot(symbol))
+            result = await yahoo_chart(symbol, "5m", "1d")
+            rows = yahoo_rows(result)
+            _, enriched = enrich(rows)
+            x = {"symbol": symbol, **(score_rows(enriched) or warmup(symbol, result, rows))}
             out.append(x)
             with db() as c:
                 c.execute("INSERT INTO signals(symbol,price,vwap,rvol,score,state,reason,created_at) VALUES(?,?,?,?,?,?,?,?)", (symbol, x.get("price"), x.get("vwap"), x.get("rvol"), x.get("score", 0), x.get("state"), x.get("reason"), datetime.now(timezone.utc).isoformat()))
         except Exception as e:
-            out.append({"symbol": symbol, "price": None, "vwap": None, "rvol": None, "score": 0, "state": "ERROR", "reason": str(e)})
+            out.append({"symbol": symbol, "price": None, "vwap": None, "rvol": None, "ema9": None, "ema20": None, "score": 0, "state": "ERROR", "reason": f"Yahoo data error: {e}"})
     out.sort(key=lambda z: z.get("score", 0), reverse=True)
     return out
+
+@app.get("/api/chart/{symbol}")
+async def chart(symbol: str):
+    symbol = symbol.upper().strip()
+    if symbol not in WATCHLIST:
+        raise HTTPException(404, "Symbol is not on the watchlist")
+    result = await yahoo_chart(symbol, "5m", "1d")
+    rows = yahoo_rows(result)
+    _, enriched = enrich(rows)
+    return {"symbol": symbol, "source": "Yahoo Finance", "bars": enriched, "analysis": score_rows(enriched)}
 
 @app.get("/api/activity")
 def activity():
