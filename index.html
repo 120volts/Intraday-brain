@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#111827">
+  <link rel="manifest" href="manifest.json">
+  <title>Intraday Brain</title>
+  <style>
+    :root{color-scheme:dark;--bg:#0b0f14;--panel:#121821;--panel2:#171f2a;--line:#273241;--text:#f5f7fa;--muted:#8f9aaa;--accent:#7dd3fc;--good:#7ee2a8;--warn:#f5d27a;--bad:#ff8f8f}
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    main{max-width:760px;margin:auto;padding:calc(16px + env(safe-area-inset-top)) 16px calc(90px + env(safe-area-inset-bottom))}
+    header{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:18px}
+    h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:3px}
+    button,select,input{font:inherit;color:var(--text);background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:10px 12px}
+    button{cursor:pointer}.primary{background:var(--accent);color:#061018;border-color:var(--accent);font-weight:700}
+    .danger{border-color:#704040;color:var(--bad)} .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+    .grid4{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+    .card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:14px;margin-top:12px}
+    .metric{min-height:86px}.label{font-size:12px;color:var(--muted)}.value{font-size:24px;font-weight:700;margin-top:5px}.positive{color:var(--good)}.negative{color:var(--bad)}
+    .row{display:flex;justify-content:space-between;align-items:center;gap:10px}.stack{display:grid;gap:9px}
+    .ticker{padding:12px;border:1px solid var(--line);border-radius:13px;background:#10161e;text-align:left;width:100%}
+    .ticker strong{font-size:17px}.ticker small{color:var(--muted)} .pill{font-size:11px;border:1px solid var(--line);padding:4px 7px;border-radius:999px}
+    .good{color:var(--good)}.warn{color:var(--warn)}.bad{color:var(--bad)}
+    .progress{height:8px;background:#202a36;border-radius:8px;overflow:hidden;margin-top:8px}.bar{height:100%;background:var(--accent)}
+    .nav{position:fixed;left:0;right:0;bottom:0;background:rgba(11,15,20,.96);border-top:1px solid var(--line);padding:9px max(12px,env(safe-area-inset-right)) calc(9px + env(safe-area-inset-bottom)) max(12px,env(safe-area-inset-left));display:flex;justify-content:center;gap:5px;z-index:5}
+    .nav button{background:transparent;border:0;padding:8px 10px;color:var(--muted);font-size:12px}.nav button.active{color:var(--accent)}
+    .page{display:none}.page.active{display:block}.tiny{font-size:12px;color:var(--muted)} .two{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+    @media(min-width:650px){.grid4{grid-template-columns:repeat(4,1fr)}.grid{grid-template-columns:repeat(4,1fr)}.nav{position:static;border:0;background:transparent;margin-top:20px}}
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div><h1>Intraday Brain</h1><div class="sub">Systematic intraday trading · paper mode</div></div>
+    <button id="mode">PAPER ON</button>
+  </header>
+
+  <section id="dashboard" class="page active">
+    <div class="grid4">
+      <div class="card metric"><div class="label">Today P/L</div><div class="value positive" id="pnl">+$184.20</div><div class="tiny">+0.74%</div></div>
+      <div class="card metric"><div class="label">Signals</div><div class="value" id="signals">3</div><div class="tiny">1 actionable</div></div>
+      <div class="card metric"><div class="label">Open trades</div><div class="value">1</div><div class="tiny">$42 risk</div></div>
+      <div class="card metric"><div class="label">Risk / trade</div><div class="value">0.50%</div><div class="tiny">$125 max</div></div>
+    </div>
+
+    <div class="card"><div class="row"><h2>Scanner</h2><span class="tiny" id="updated">Updated just now</span></div><div class="stack" id="scanner" style="margin-top:10px"></div></div>
+
+    <div class="card">
+      <div class="row"><h2>Best setup</h2><span class="pill good">84/100</span></div>
+      <div class="two" style="margin-top:12px">
+        <div><div class="label">Symbol</div><strong id="bestSymbol">NVDA</strong></div>
+        <div><div class="label">Setup</div><strong>VWAP reclaim</strong></div>
+        <div><div class="label">Entry zone</div><strong>$181.80–182.30</strong></div>
+        <div><div class="label">Invalidation</div><strong>$179.90</strong></div>
+        <div><div class="label">Target</div><strong>$186.10</strong></div>
+        <div><div class="label">Reward / risk</div><strong>2.2R</strong></div>
+      </div>
+      <button class="primary" id="paperTrade" style="width:100%;margin-top:14px">SIMULATE PAPER TRADE</button>
+      <div class="tiny" id="message" aria-live="polite" style="margin-top:9px"></div>
+    </div>
+  </section>
+
+  <section id="scannerPage" class="page">
+    <div class="card"><h2>Scanner</h2><div class="tiny">Sorted by setup score</div><div class="stack" id="scannerFull" style="margin-top:12px"></div></div>
+  </section>
+
+  <section id="positionsPage" class="page">
+    <div class="card"><h2>Paper positions</h2><div class="stack" style="margin-top:12px">
+      <div class="ticker"><div class="row"><strong>NVDA · LONG</strong><span class="good">+$42.80</span></div><div class="tiny">Entry $181.92 · Stop $179.90 · Target $186.10</div><div class="progress"><div class="bar" style="width:54%"></div></div></div>
+    </div></div>
+    <div class="card"><h2>Risk controls</h2><div class="stack" style="margin-top:12px">
+      <div class="row"><span>Max risk / trade</span><strong>0.50%</strong></div>
+      <div class="row"><span>Max daily loss</span><strong>1.50%</strong></div>
+      <div class="row"><span>Max open trades</span><strong>2</strong></div>
+    </div></div>
+  </section>
+
+  <section id="historyPage" class="page">
+    <div class="card"><h2>Trade history</h2><div class="stack" id="history" style="margin-top:12px"></div></div>
+  </section>
+
+  <section id="settingsPage" class="page">
+    <div class="card"><h2>Strategy controls</h2><div class="stack" style="margin-top:12px">
+      <label>Risk per trade <select><option>0.25%</option><option selected>0.50%</option><option>0.75%</option><option>1.00%</option></select></label>
+      <label>Minimum reward/risk <select><option>1.5R</option><option selected>1.8R</option><option>2.0R</option><option>2.5R</option></select></label>
+      <label>Opening range <select><option>15 minutes</option><option selected>30 minutes</option><option>45 minutes</option></select></label>
+      <label>Max trades/day <select><option>1</option><option selected>2</option><option>3</option></select></label>
+    </div></div>
+    <div class="card"><h2>Safety</h2><p class="tiny">Real trading is intentionally unavailable in this build. When execution is eventually added, it will require a separate explicit live-mode control and broker authorization.</p><button class="danger" id="reset">Reset demo data</button></div>
+  </section>
+</main>
+
+<nav class="nav">
+  <button class="active" data-page="dashboard">Dashboard</button>
+  <button data-page="scannerPage">Scanner</button>
+  <button data-page="positionsPage">Positions</button>
+  <button data-page="historyPage">History</button>
+  <button data-page="settingsPage">Settings</button>
+</nav>
+
+<script>
+const symbols=[
+ {s:"NVDA",p:"+2.31%",state:"SETUP",score:84},
+ {s:"QQQ",p:"+1.14%",state:"TREND",score:76},
+ {s:"SPY",p:"+0.82%",state:"TREND",score:71},
+ {s:"AMZN",p:"+1.02%",state:"SETUP",score:69},
+ {s:"TSLA",p:"+1.72%",state:"VOLATILE",score:63},
+ {s:"MSFT",p:"+0.44%",state:"WAIT",score:58},
+ {s:"META",p:"+0.27%",state:"WAIT",score:51},
+ {s:"AAPL",p:"-0.18%",state:"WAIT",score:43},
+ {s:"GOOGL",p:"-0.32%",state:"WEAK",score:37}
+];
+function card(x){
+ const cls=x.state==="SETUP"||x.state==="TREND"?"good":x.state==="WEAK"?"bad":"warn";
+ return `<button class="ticker" data-s="${x.s}"><div class="row"><strong>${x.s}</strong><span>${x.p}</span></div><div class="row" style="margin-top:5px"><small>${x.state}</small><small class="${cls}">score ${x.score}</small></div><div class="progress"><div class="bar" style="width:${x.score}%"></div></div></button>`;
+}
+function render(){
+ document.querySelector("#scanner").innerHTML=symbols.slice(0,5).map(card).join("");
+ document.querySelector("#scannerFull").innerHTML=symbols.map(card).join("");
+ document.querySelectorAll("[data-s]").forEach(b=>b.addEventListener("click",()=>{
+   document.querySelector("#bestSymbol").textContent=b.dataset.s;
+   document.querySelector("#message").textContent=`${b.dataset.s} selected. Live market data will be connected to the server backend.`;
+ }));
+}
+render();
+
+document.querySelectorAll(".nav button").forEach(btn=>btn.addEventListener("click",()=>{
+ document.querySelectorAll(".nav button").forEach(b=>b.classList.remove("active"));
+ btn.classList.add("active");
+ document.querySelectorAll(".page").forEach(p=>p.classList.remove("active"));
+ document.getElementById(btn.dataset.page).classList.add("active");
+}));
+
+document.getElementById("mode").addEventListener("click",e=>{
+ const on=e.target.textContent==="PAPER ON";
+ e.target.textContent=on?"PAPER OFF":"PAPER ON";
+ document.getElementById("message").textContent=on?"Paper trading paused.":"Paper trading enabled.";
+});
+document.getElementById("paperTrade").addEventListener("click",()=>{
+ document.getElementById("message").textContent="Paper order simulated for NVDA. No real order was sent.";
+ const h=document.getElementById("history");
+ h.insertAdjacentHTML("afterbegin",`<div class="ticker"><div class="row"><strong>NVDA · PAPER LONG</strong><span class="good">OPEN</span></div><div class="tiny">Simulated just now · risk $125 · target 2.2R</div></div>`);
+});
+document.getElementById("reset").addEventListener("click",()=>{
+ document.getElementById("message").textContent="Demo state reset.";
+ document.getElementById("history").innerHTML="";
+});
+</script>
+</body>
+</html>
